@@ -1,0 +1,7 @@
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand = "python -u bot_flex300_full_vip2.py"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 5
