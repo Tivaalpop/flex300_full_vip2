@@ -89,7 +89,8 @@ def get_user_operation_lock(user_id: int) -> asyncio.Lock:
 # ================== الإعدادات العامة ==================
 BOT_TOKEN = "8750833576:AAFkRvSD4PBiEgnYk6rWSCv1PHfUqgV9U8c"
 ADMIN_ID = 1444139300
-DB_PATH = Path("family_bot.db")
+DB_PATH = Path(os.environ.get("DB_PATH", "/data/family_bot.db"))
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 LOG_FILE = Path("bot_actions.log")
 MAINTENANCE_MODE = False
 TOKEN_REFRESH_THRESHOLD = 300
