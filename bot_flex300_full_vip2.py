@@ -87,8 +87,12 @@ def get_user_operation_lock(user_id: int) -> asyncio.Lock:
     return lock
 
 # ================== الإعدادات العامة ==================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()  # أضف التوكن الجديد في متغير البيئة BOT_TOKEN
-ADMIN_ID = 1444139300
+# جلب التوكن من الاستضافة، وإذا لم يجده (مثل حالة الهاتف) يستخدم التوكن المكتوب بالأسفل
+BOT_TOKEN = os.getenv("BOT_TOKEN", "ضع_التوكن_الخاص_بك_هنا")
+
+# جلب الآي دي وتحويله لرقم صحيح (Integer) لأن التليجرام يتطلبه كرقم وليس نص
+ADMIN_ID = int(os.getenv("ADMIN_ID", "123456789"))
+
 # حفظ القاعدة داخل الـ Volume الدائم على Railway، أو محلياً إذا لم يتوفر المجلد
 DATA_DIR = Path("/data") if Path("/data").is_dir() else Path(".")
 DB_PATH = DATA_DIR / "family_bot.db"
