@@ -87,7 +87,7 @@ def get_user_operation_lock(user_id: int) -> asyncio.Lock:
     return lock
 
 # ================== الإعدادات العامة ==================
-BOT_TOKEN = "8750833576:AAFkRvSD4PBiEgnYk6rWSCv1PHfUqgV9U8c"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()  # أضف التوكن الجديد في متغير البيئة BOT_TOKEN
 ADMIN_ID = 1444139300
 # حفظ القاعدة داخل الـ Volume الدائم على Railway، أو محلياً إذا لم يتوفر المجلد
 DATA_DIR = Path("/data") if Path("/data").is_dir() else Path(".")
@@ -200,13 +200,17 @@ def extract_name_from_jwt(token: str, fallback_name: str = "صديقي") -> str:
     return fallback_name.strip() if fallback_name and fallback_name.strip() else "بطل"
 
 # ================== قاعدة البيانات عالية التحمل (WAL Mode) ==================
-def get_db_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=45.0, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    conn.execute("PRAGMA cache_size=-32000;")
-    conn.execute("PRAGMA busy_timeout=30000;")
+def get_db_connection():
+    # تحديد المجلد الذي يوجد فيه ملف البايثون الحالي
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    # دمج المسار مع اسم قاعدة البيانات
+    db_path = os.path.join(base_dir, "database.db")
+    
+    # الاتصال بقاعدة البيانات
+    conn = sqlite3.connect(db_path)
     return conn
+
 
 def encrypt_password(password: str) -> str:
     return base64.b64encode(password.encode()).decode()
@@ -725,107 +729,139 @@ async def show_login_screen(update: Update, user_id: int, context: Optional[Cont
         await send_message(update, user_id, "يرجى تسجيل الدخول أولاً.\nأرسل رقم هاتفك (مثال: 01012345678)")
         user_states[user_id] = {'state': 'login_phone'}
 
-# ================== تزويد يومين وتنظيف العائلة ==================
+# ================== تزويد يومين ==================
 async def add_two_days(update: Update, user_id: int, context: Optional[ContextTypes.DEFAULT_TYPE], target_phone: Optional[str] = None) -> None:
     operation_lock = get_user_operation_lock(user_id)
     if operation_lock.locked():
         await send_message(update, user_id, "⏳ فيه عملية أخرى شغالة على الحساب. استنى لحد ما تخلص.", None)
         return
-    if target_phone:
-        token = get_valid_token(user_id, target_phone)
-        if not token:
-            saved_password = get_saved_password(user_id, target_phone)
-            if saved_password:
+    async with operation_lock:
+        if target_phone:
+            token = get_valid_token(user_id, target_phone)
+            if not token:
+                saved_password = get_saved_password(user_id, target_phone)
+                if saved_password:
+                    try:
+                        token, expiry = await login_vodafone(target_phone, saved_password)
+                        save_token(user_id, target_phone, token, expiry)
+                    except Exception as e:
+                        log_action(user_id, "ADD_TWO_DAYS_MEMBER_LOGIN_FAIL", f"{target_phone}: {e}")
+                        token = None
+            if not token:
+                await send_message(update, user_id, f"🔐 لا توجد جلسة صالحة للرقم {target_phone}. سجّل الدخول للرقم واحفظه أولًا، ثم أعد المحاولة.")
+                return
+            phone = target_phone
+        else:
+            user = await ensure_valid_session(update, user_id)
+            if not user:
+                await show_login_screen(update, user_id, context)
+                return
+            phone = user['phone']
+            token = user['access_token']
+
+        url = "https://mobile.vodafone.com.eg/services/dxl/pom/productOrder"
+        headers = build_base_headers({'api-host': 'ProductOrderingManagement', 'useCase': 'FlexACPRenewal', 'Authorization': f'Bearer {token}', 'api-version': 'v2', 'msisdn': phone, 'X-Request-ID': f'FLEX_{int(now_cairo().timestamp())}'})
+        payload = {"channel": {"name": "MobileApp"}, "orderItem": [{"action": "insert", "id": "FLEX_ROLLOVER", "product": {"characteristic": [{"name": "PaymentMethod", "value": "ACP"}, {"name": "ACP", "value": "True"}, {"name": "SMSID", "value": "MUTE_SMS"}], "encProductId": "8UaJf2TAFkQncd2YduZwRAbXrixRX0FbzsLM/WakGJhTeK0tEE5sc5f4a8TXyo9FYlvdb1bT75cEIo+D1y5rkWQUjSwKtd0EJRxzp9wIrbuKtupFTfAhNLcfTdjt7hDOMkiZSWlblb1Ne9CrZgq2/ptclZCRIlstBSrTme3YLhxCUzhbMrwOuYQoJaMg6uXx/FrIO9Dd3tgz2kTemb36IO5s7N0rSYVzyzPOoHJb5gGC69r3InrZ9JJql/vr5cS+BP33wKGpUNg9P207RLPthMUVyTZSrCnGQMQ+fXXMocCGTEwzOH/D7DRf2GCGg2OHZLL/DfL1cc0Sh6Yoc1hb", "id": "Flex_2021_523", "relatedParty": [{"id": phone, "name": "MSISDN", "role": "Subscriber"}]}, "eCode": 0}], "@type": "FlexACPRenewal"}
+        try:
+            await query_or_message(update, "⏳ جاري محاولة تزويد الباقة يومين...")
+            response = await asyncio.to_thread(lambda: HTTP_SESSION.post(url, headers=headers, json=payload, timeout=30))
+            if 200 <= response.status_code < 300:
                 try:
-                    token, expiry = await login_vodafone(target_phone, saved_password)
-                    save_token(user_id, target_phone, token, expiry)
-                except Exception as e:
-                    log_action(user_id, "ADD_TWO_DAYS_MEMBER_LOGIN_FAIL", f"{target_phone}: {e}")
-                    token = None
-        if not token:
-            await send_message(update, user_id, f"🔐 لا توجد جلسة صالحة للرقم {target_phone}. سجّل الدخول للرقم واحفظه أولًا، ثم أعد المحاولة.")
-            return
-        phone = target_phone
-    else:
-        user = await ensure_valid_session(update, user_id)
-        if not user:
-            await show_login_screen(update, user_id, context)
-            return
-        phone = user['phone']
-        token = user['access_token']
-
-    url = "https://mobile.vodafone.com.eg/services/dxl/pom/productOrder"
-    headers = build_base_headers({'api-host': 'ProductOrderingManagement', 'useCase': 'FlexACPRenewal', 'Authorization': f'Bearer {token}', 'api-version': 'v2', 'msisdn': phone, 'X-Request-ID': f'FLEX_{int(now_cairo().timestamp())}'})
-    payload = {"channel": {"name": "MobileApp"}, "orderItem": [{"action": "insert", "id": "FLEX_ROLLOVER", "product": {"characteristic": [{"name": "PaymentMethod", "value": "ACP"}, {"name": "ACP", "value": "True"}, {"name": "SMSID", "value": "MUTE_SMS"}], "encProductId": "8UaJf2TAFkQncd2YduZwRAbXrixRX0FbzsLM/WakGJhTeK0tEE5sc5f4a8TXyo9FYlvdb1bT75cEIo+D1y5rkWQUjSwKtd0EJRxzp9wIrbuKtupFTfAhNLcfTdjt7hDOMkiZSWlblb1Ne9CrZgq2/ptclZCRIlstBSrTme3YLhxCUzhbMrwOuYQoJaMg6uXx/FrIO9Dd3tgz2kTemb36IO5s7N0rSYVzyzPOoHJb5gGC69r3InrZ9JJql/vr5cS+BP33wKGpUNg9P207RLPthMUVyTZSrCnGQMQ+fXXMocCGTEwzOH/D7DRf2GCGg2OHZLL/DfL1cc0Sh6Yoc1hb", "id": "Flex_2021_523", "relatedParty": [{"id": phone, "name": "MSISDN", "role": "Subscriber"}]}, "eCode": 0}], "@type": "FlexACPRenewal"}
-    try:
-        await query_or_message(update, "⏳ جاري محاولة تزويد الباقة يومين...")
-        response = await asyncio.to_thread(lambda: HTTP_SESSION.post(url, headers=headers, json=payload, timeout=30))
-        if 200 <= response.status_code < 300:
-            try:
-                result = response.json()
-            except Exception:
-                result = {}
-            msg = "✅ تم إضافة يومين لباقة فليكس بنجاح 🎉" if result.get("state") == "Completed" else f"✅ تم قبول الطلب بنجاح. كود الحالة: {response.status_code}"
-        elif response.status_code == 400:
-            try:
-                error_data = response.json()
-            except Exception:
-                error_data = {}
-            code = str(error_data.get("code", ""))
-            if code == "2037":
-                msg = "⚠️ تم استخدام تزويد اليومين من قبل لهذا الشهر."
-            elif code == "1001":
-                msg = "🔒 انتهت صلاحية الجلسة. سجل الدخول مرة أخرى."
-            elif code == "1005":
-                msg = "📵 رقم الهاتف غير صالح."
+                    result = response.json()
+                except Exception:
+                    result = {}
+                state = str(result.get("state", "")).strip().lower()
+                if state == "completed":
+                    msg = "✅ تم تأكيد إضافة يومين لباقة فليكس بنجاح 🎉"
+                elif response.status_code == 202 or state in {"pending", "inprogress", "in_progress", "accepted"}:
+                    msg = "⏳ تم استلام الطلب، لكن التنفيذ لم يتأكد بعد. راجع حالة الباقة قبل إعادة المحاولة."
+                else:
+                    msg = "⚠️ الخادم استقبل الطلب، لكنه لم يرسل تأكيد اكتمال. لم أعتبر العملية ناجحة لتجنب تكرار الطلب."
+            elif response.status_code == 400:
+                try:
+                    error_data = response.json()
+                except Exception:
+                    error_data = {}
+                code = str(error_data.get("code", ""))
+                if code == "2037":
+                    msg = "⚠️ تم استخدام تزويد اليومين من قبل لهذا الشهر."
+                elif code == "1001":
+                    msg = "🔒 انتهت صلاحية الجلسة. سجل الدخول مرة أخرى."
+                elif code == "1005":
+                    msg = "📵 رقم الهاتف غير صالح."
+                else:
+                    msg = f"❌ لم يتم تزويد اليومين.\nالسبب: {error_data.get('reason', 'الطلب غير متاح حالياً')}"
+            elif response.status_code == 401:
+                msg = "🔒 الجلسة غير صالحة أو انتهت. سجل الدخول مرة أخرى."
+            elif response.status_code == 403:
+                msg = "⛔ الخدمة غير متاحة لهذا الحساب حالياً."
             else:
-                msg = f"❌ لم يتم تزويد اليومين.\nالسبب: {error_data.get('reason', 'الطلب غير متاح حالياً')}"
-        elif response.status_code == 401:
-            msg = "🔒 الجلسة غير صالحة أو انتهت. سجل الدخول مرة أخرى."
-        elif response.status_code == 403:
-            msg = "⛔ الخدمة غير متاحة لهذا الحساب حالياً."
-        else:
-            msg = f"❌ لم يتم تزويد اليومين. كود الخادم: {response.status_code}"
-    except requests.exceptions.Timeout:
-        msg = "⏰ انتهت مهلة الاتصال. حاول مرة أخرى."
-    except Exception as e:
-        log_action(user_id, "ADD_TWO_DAYS_FAIL", str(e))
-        msg = "❌ حدث خطأ أثناء تنفيذ تزويد اليومين."
-    keyboard = [[InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="main_menu")]]
-    await send_message(update, user_id, msg, InlineKeyboardMarkup(keyboard))
+                msg = f"❌ لم يتم تزويد اليومين. كود الخادم: {response.status_code}"
+        except requests.exceptions.Timeout:
+            msg = "⏰ انتهت مهلة الاتصال. حاول مرة أخرى."
+        except Exception as e:
+            log_action(user_id, "ADD_TWO_DAYS_FAIL", str(e))
+            msg = "❌ حدث خطأ أثناء تنفيذ تزويد اليومين."
+        keyboard = [[InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="main_menu")]]
+        await send_message(update, user_id, msg, InlineKeyboardMarkup(keyboard))
 
-async def perform_full_cleaning_silent(update: Update, user_id: int, owner_num: str, owner_pass: str, member_num: str, member_pass: str, context: ContextTypes.DEFAULT_TYPE) -> None:
-    progress_msg = await update.message.reply_text("🧹 **تنظيف العائلة**\n[░░░░░░░░░░░░░░░░░░░░] 0%", parse_mode='Markdown')
-    def update_progress(percent: int, bar_length: int = 20):
-        filled = int(bar_length * percent // 100)
-        bar = "█" * filled + "░" * (bar_length - filled)
-        asyncio.create_task(progress_msg.edit_text(f"🧹 **تنظيف العائلة**\n[{bar}] {percent}%", parse_mode='Markdown'))
-    try:
-        update_progress(10); owner_token, _ = await login_vodafone(owner_num, owner_pass); await asyncio.sleep(0.5)
-        update_progress(20); await send_invitation(owner_token, owner_num, member_num, 10); await asyncio.sleep(7)
-        update_progress(30); await remove_member(owner_token, owner_num, member_num); await asyncio.sleep(7)
-        update_progress(50)
-        if not await send_invitation(owner_token, owner_num, member_num, 10):
-            await progress_msg.edit_text("❌ لم يتم تنظيف العائلة"); return
-        await asyncio.sleep(7)
-        update_progress(70); member_token, _ = await login_vodafone(member_num, member_pass)
-        if not await accept_invitation(member_token, member_num, owner_num):
-            await progress_msg.edit_text("❌ لم يتم تنظيف العائلة"); return
-        await asyncio.sleep(7)
-        update_progress(85)
-        if not await update_quota(owner_token, owner_num, member_num, 40):
-            await progress_msg.edit_text("❌ لم يتم تنظيف العائلة"); return
-        await asyncio.sleep(7)
-        update_progress(95)
-        for _ in range(3):
-            if await remove_member(owner_token, owner_num, member_num):
-                break
-            await asyncio.sleep(7)
-        else:
-            await progress_msg.edit_text("❌ لم يتم تنظيف العائلة"); return
-        update_progress(100); await asyncio.sleep(2); await progress_msg.edit_text("✅ **تم تنظيف العائلة بنجاح!**", parse_mode='Markdown')
-    except Exception:
-        await progress_msg.edit_text("❌ لم يتم تنظيف العائلة")
+# ================== واجهة باقات الإنترنت ==================
+async def show_internet_packages_menu(update: Update, user_id: int, context: Optional[ContextTypes.DEFAULT_TYPE]) -> None:
+    is_callback = update.callback_query is not None
+    if not await require_subscription_or_free(update, context, is_callback=is_callback, query=update.callback_query if is_callback else None):
+        return
+    user = await ensure_valid_session(update, user_id)
+    if not user:
+        await show_login_screen(update, user_id, context)
+        return
+
+    keyboard = [
+        [InlineKeyboardButton("⚡ باقات إكستريم", callback_data="internet_extreme_info"), InlineKeyboardButton("➕ باقات بلص", callback_data="internet_plus_info")],
+        [InlineKeyboardButton("📊 تقرير باقات الإنترنت", callback_data="internet_report_info")],
+        [InlineKeyboardButton("🗑️ إلغاء باقة إنترنت", callback_data="internet_cancel_info")],
+        [InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="main_menu")],
+    ]
+    menu_text = (
+        "🌐 **إدارة باقات الإنترنت**\n\n"
+        "اختر القسم المطلوب. العرض الحالي معلوماتي؛ التفعيل وقراءة البيانات والإلغاء "
+        "لن تُنفذ قبل توفير واجهة رسمية موثقة."
+    )
+    markup = InlineKeyboardMarkup(keyboard)
+    if update.callback_query:
+        await update.callback_query.edit_message_text(menu_text, reply_markup=markup, parse_mode="Markdown")
+    else:
+        await send_message(update, user_id, menu_text, markup, parse_mode="Markdown")
+
+
+async def show_internet_package_info(update: Update, user_id: int, section: str) -> None:
+    if section == "extreme":
+        body = (
+            "⚡ **باقات إكستريم**\n\n"
+            "• إكستريم 13 — 10 جنيه\n"
+            "• إكستريم 26 — 20 جنيه\n"
+            "• إكستريم 52 — 40 جنيه\n\n"
+            "هذه التفاصيل من الملف المرجعي المرفق، وليست تحققًا من الأسعار الحالية."
+        )
+    elif section == "plus":
+        body = (
+            "➕ **باقات بلص**\n\n"
+            "• باقة بلص 20\n• باقة بلص 32\n• باقة بلص 45\n\n"
+            "الملف المرجعي لا يحدد أسعار هذه الباقات."
+        )
+    elif section == "report":
+        body = "📊 التقرير المباشر غير مفعّل حاليًا. يلزم توثيق واجهة رسمية لقراءة استهلاك الباقات قبل ربطها."
+    else:
+        body = "🗑️ إلغاء باقات الإنترنت غير مفعّل حاليًا. لن يتم إرسال طلب إلغاء قبل اعتماد واجهة رسمية موثقة واختبارها."
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 رجوع لباقات النت", callback_data="internet_packages_menu")],
+        [InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="main_menu")],
+    ])
+    if update.callback_query:
+        await update.callback_query.edit_message_text(body, reply_markup=keyboard, parse_mode="Markdown")
+    else:
+        await send_message(update, user_id, body, keyboard, parse_mode="Markdown")
+
 
 # ================== القائمة الرئيسية وإدارة العائلة (بعد التعديلات) ==================
 async def show_main_menu(update: Update, user_id: int, context: Optional[ContextTypes.DEFAULT_TYPE]) -> None:
@@ -839,14 +875,13 @@ async def show_main_menu(update: Update, user_id: int, context: Optional[Context
         context.user_data['rocket_members'] = []
 
     acc_name = user.get('account_name') or "بطل"
-    # تم إزالة زر قبول دعوة الفرد من القائمة الرئيسية وتنسيق الأزرار باحترافية
     keyboard = [
-        [InlineKeyboardButton("🏠 إدارة العائلة", callback_data="show_family"), InlineKeyboardButton("📅 تزويد يومين", callback_data="add_two_days")],
-        [InlineKeyboardButton("💰 خصم فليكس (لحظي / حجز 12ص)", callback_data="flex_discount")],
-        [InlineKeyboardButton("📊 نسبة الأونر", callback_data="show_owner_remaining"), InlineKeyboardButton("📊 استهلاك الأعضاء", callback_data="show_consumption")],
-        [InlineKeyboardButton("📞 أرقامي المحفوظة", callback_data="show_saved"), InlineKeyboardButton("🧹 تنظيف العائلة", callback_data="clean_family")],
-        [InlineKeyboardButton("🔄 تحويل انظمه", callback_data="packages_services")],
-        [InlineKeyboardButton("🚀 تعليق دعوتين (VIP)", callback_data="sendonly_menu"), InlineKeyboardButton("🔄 حساب آخر", callback_data="another_account")]
+        [InlineKeyboardButton("🚀 تعليق دعوتين (VIP)", callback_data="sendonly_menu")],
+        [InlineKeyboardButton("📅 تزويد يومين", callback_data="add_two_days"), InlineKeyboardButton("🏠 إدارة العائلة", callback_data="show_family")],
+        [InlineKeyboardButton("💰 خصم فليكس", callback_data="flex_discount")],
+        [InlineKeyboardButton("🔄 تحويل انظمه", callback_data="packages_services"), InlineKeyboardButton("📊 نسبة الأونر", callback_data="show_owner_remaining")],
+        [InlineKeyboardButton("🌐 باقات نت", callback_data="internet_packages_menu")],
+        [InlineKeyboardButton("🔄 حساب آخر", callback_data="another_account"), InlineKeyboardButton("📞 أرقامي المحفوظة", callback_data="show_saved")]
     ]
     text = (
         f"👑 **أهلاً بيك يا أستاذ {acc_name} في لوحة التحكم** 👑\n"
@@ -2278,17 +2313,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             await update.message.reply_text(f"❌ فشل التبديل: {str(e)}", parse_mode=None); del user_states[user_id]
 
-    elif state == 'cleaning_ask_owner_pass':
-        user_states[user_id] = {'state': 'cleaning_ask_member', 'owner_num': state_data.get('owner_num'), 'owner_pass': text}
-        await update.message.reply_text("📞 أدخل رقم العضو المراد تنظيفه:", parse_mode=None)
-
-    elif state == 'cleaning_ask_member':
-        user_states[user_id] = {'state': 'cleaning_ask_member_pass', 'owner_num': state_data.get('owner_num'), 'owner_pass': state_data.get('owner_pass'), 'member_num': text}
-        await update.message.reply_text("🔐 أدخل كلمة مرور حساب العضو:", parse_mode=None)
-
-    elif state == 'cleaning_ask_member_pass':
-        await perform_full_cleaning_silent(update, user_id, state_data.get('owner_num'), state_data.get('owner_pass'), state_data.get('member_num'), text, context)
-        del user_states[user_id]
 
     else:
         await send_message(update, user_id, "حدث خطأ. استخدم /start للبدء من جديد.")
@@ -2325,14 +2349,19 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "another_account":
+        # إنهاء الجلسة النشطة فقط مع الإبقاء على الأرقام والتوكنات المحفوظة.
         delete_user(user_id)
-        if user_id in user_states:
-            del user_states[user_id]
-        if context.user_data.get('rocket_members'):
-            context.user_data['rocket_members'] = []
+        user_states.pop(user_id, None)
+        for key in ("rocket_members", "flex_discount_offer", "flex_discount_token", "packages_pending_flex", "packages_convert14_confirm"):
+            context.user_data.pop(key, None)
+        # لا تحذف رسالة الزر الحالية قبل تعديلها؛ امسح بقية الرسائل فقط.
+        current_message_id = query.message.message_id if query.message else None
+        if current_message_id is not None:
+            user_messages[user_id] = [mid for mid in user_messages.get(user_id, []) if mid != current_message_id]
         await clear_previous_messages(update, user_id)
-        await query.edit_message_text("✅ تم تسجيل الخروج بنجاح.", parse_mode=None)
-        await show_login_screen(update, user_id, context); return
+        await query.edit_message_text("✅ تم تسجيل الخروج من الحساب الحالي. بيانات الأرقام المحفوظة ما زالت موجودة.", parse_mode=None)
+        await show_login_screen(update, user_id, context)
+        return
 
     if data == "main_menu":
         context.user_data.pop('flex_discount_offer', None)
@@ -2347,16 +2376,25 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await clear_previous_messages(update, user_id)
         await show_family_screen(update, user_id, context); return
 
-    if data == "clean_family":
-        owner_data = get_user(user_id)
-        if not owner_data:
-            await query.edit_message_text("❌ يجب تسجيل الدخول أولاً.", parse_mode=None); return
-        saved_owner_pass = get_saved_password(user_id, owner_data['phone'])
-        if saved_owner_pass:
-            user_states[user_id] = {'state': 'cleaning_ask_member', 'owner_num': owner_data['phone'], 'owner_pass': saved_owner_pass}
-            await query.edit_message_text("📞 أدخل رقم العضو المراد تنظيفه:", parse_mode=None); return
-        user_states[user_id] = {'state': 'cleaning_ask_owner_pass', 'owner_num': owner_data['phone']}
-        await query.edit_message_text("🔐 أدخل كلمة مرور حساب المالك للتأكيد:", parse_mode=None); return
+    if data == "internet_packages_menu":
+        await show_internet_packages_menu(update, user_id, context)
+        return
+
+    if data in {"internet_extreme_info", "internet_plus_info", "internet_report_info", "internet_cancel_info"}:
+        if not await require_subscription_or_free(update, context, is_callback=True, query=query):
+            return
+        user = await ensure_valid_session(update, user_id)
+        if not user:
+            await show_login_screen(update, user_id, context)
+            return
+        section = {
+            "internet_extreme_info": "extreme",
+            "internet_plus_info": "plus",
+            "internet_report_info": "report",
+            "internet_cancel_info": "cancel",
+        }[data]
+        await show_internet_package_info(update, user_id, section)
+        return
 
     if data == "show_consumption":
         await show_consumption(update, user_id, context); return
@@ -2367,6 +2405,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("use_num_"):
         num = data[8:]
+        if num not in get_saved_numbers(user_id):
+            await query.answer("❌ هذا الرقم غير موجود ضمن أرقامك المحفوظة.", show_alert=True)
+            return
         token = get_valid_token(user_id, num)
         exp_dt = None
         if token:
@@ -2596,6 +2637,8 @@ async def post_shutdown(app: Application):
         await GLOBAL_AIOHTTP_SESSION.close()
 
 def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("لم يتم ضبط BOT_TOKEN. أضف توكنًا جديدًا في متغيرات البيئة بعد إلغاء التوكن المكشوف.")
     init_db()
     # تفعيل concurrent_updates لتحمل الضغط العالي جداً بدون أي تهنيج
     app = (
@@ -2631,7 +2674,7 @@ def main():
     app.add_handler(MessageHandler(filters.Text("⏹️ إيقاف العملية"), stop_sendonly_process))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(button_callback))
-    print("✅ البوت يعمل بنجاح - النسخة الاحترافية المطورة (Anti-Ban + Midnight Scheduler + High Concurrency)")
+    print("✅ البوت يعمل بنجاح - النسخة المطورة (Midnight Scheduler + Concurrent Updates)")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
