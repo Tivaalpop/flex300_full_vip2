@@ -87,12 +87,8 @@ def get_user_operation_lock(user_id: int) -> asyncio.Lock:
     return lock
 
 # ================== الإعدادات العامة ==================
-# جلب التوكن من الاستضافة، وإذا لم يجده (مثل حالة الهاتف) يستخدم التوكن المكتوب بالأسفل
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8750833576:AAG4bLZ0tZZmn9Vzlum7S7iTpJkvhGCcAkc")
-
-# جلب الآي دي وتحويله لرقم صحيح (Integer) لأن التليجرام يتطلبه كرقم وليس نص
-ADMIN_ID = int(os.getenv("ADMIN_ID", "1444139300"))
-
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8750833576:AAG4bLZ0tZZmn9Vzlum7S7iTpJkvhGCcAkc").strip()  # ضع التوكن في متغير البيئة فقط، ولا تحفظه داخل الملف
+ADMIN_ID = 1444139300
 # حفظ القاعدة داخل الـ Volume الدائم على Railway، أو محلياً إذا لم يتوفر المجلد
 DATA_DIR = Path("/data") if Path("/data").is_dir() else Path(".")
 DB_PATH = DATA_DIR / "family_bot.db"
@@ -452,7 +448,7 @@ def get_valid_token(user_id: int, number: str) -> Optional[str]:
 
 def save_user(telegram_id: int, phone: str, token: str, expiry: datetime, account_name: str = "") -> None:
     if not account_name:
-        account_name = get_saved_account_name(telegram_id, phone) or "بطل"
+        account_name = get_saved_account_name(telegram_id, phone) or "مستخدم"
     with get_db_connection() as conn:
         conn.execute(
             'INSERT OR REPLACE INTO users (telegram_id, phone, access_token, token_expiry, account_name) VALUES (?, ?, ?, ?, ?)',
@@ -471,7 +467,7 @@ def get_user(telegram_id: int) -> Optional[Dict[str, Any]]:
             'phone': phone,
             'access_token': token,
             'token_expiry': datetime.fromisoformat(expiry_str),
-            'account_name': acc_name or "بطل"
+            'account_name': acc_name or "VF-app"
         }
     return None
 
@@ -526,7 +522,7 @@ async def fetch_vodafone_customer_name(token: str, phone: str, fallback_name: st
     profile_name = await asyncio.to_thread(sync_fetch_profile)
     if profile_name:
         return profile_name
-    return fallback_name.strip() if fallback_name and fallback_name.strip() else "بطل"
+    return fallback_name.strip() if fallback_name and fallback_name.strip() else "VF-app"
 
 async def login_vodafone(phone: str, password: str) -> Tuple[str, datetime]:
     headers = build_base_headers({'Content-Type': 'application/x-www-form-urlencoded', 'silentLogin': 'true', 'msisdn': phone})
@@ -809,7 +805,645 @@ async def add_two_days(update: Update, user_id: int, context: Optional[ContextTy
         keyboard = [[InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="main_menu")]]
         await send_message(update, user_id, msg, InlineKeyboardMarkup(keyboard))
 
+# ================== محرك باقات الإنترنت (Plus / Extreme) ==================
+INTERNET_OFFERING_URL = "https://mobile.vodafone.com.eg/services/dxl/epo/eligibleProductOffering"
+INTERNET_ORDER_URL = "https://mobile.vodafone.com.eg/services/dxl/pom/productOrder"
+
+def _internet_api_headers(token: str, phone: str) -> Dict[str, str]:
+    return {
+        "User-Agent": "okhttp/4.12.0",
+        "Connection": "Keep-Alive",
+        "Accept": "application/json",
+        "Authorization": f"Bearer {token}",
+        "api-version": "v2",
+        "device-id": "7be546fe335911d2",
+        "x-agent-operatingsystem": "13",
+        "clientId": "AnaVodafoneAndroid",
+        "x-agent-device": "Samsung SM-A515F",
+        "x-agent-version": "2025.11.1",
+        "x-agent-build": "1063",
+        "msisdn": phone,
+        "Content-Type": "application/json",
+        "Accept-Language": "ar",
+    }
+
+
+def _internet_parse_offerings(raw_data: Any, package_type: str) -> List[Dict[str, Any]]:
+    """استخراج الباقات من استجابة eligibleProductOffering مع التحقق من حقول التفعيل."""
+    if isinstance(raw_data, dict):
+        raw_data = raw_data.get("data", raw_data.get("items", [raw_data]))
+    if not isinstance(raw_data, list):
+        return []
+
+    if package_type == "plus":
+        accepted_names = ("بلص", "plus")
+    else:
+        accepted_names = ("إكستريم", "اكستريم", "extreme")
+
+    packages: List[Dict[str, Any]] = []
+    for item in raw_data:
+        if not isinstance(item, dict):
+            continue
+        parts = item.get("parts") or {}
+        offerings = parts.get("productOffering", []) if isinstance(parts, dict) else []
+        if isinstance(offerings, dict):
+            offerings = [offerings]
+        if not isinstance(offerings, list):
+            continue
+
+        for offering in offerings:
+            if not isinstance(offering, dict):
+                continue
+            name = str(offering.get("name") or "").strip()
+            if not name or not any(term in name.lower() for term in accepted_names):
+                continue
+
+            package_id = ""
+            enc_product_id = ""
+            id_items = offering.get("id", [])
+            if isinstance(id_items, dict):
+                id_items = [id_items]
+            if isinstance(id_items, list):
+                for id_item in id_items:
+                    if not isinstance(id_item, dict):
+                        continue
+                    scheme = str(id_item.get("schemeName", "")).lower()
+                    value = str(id_item.get("value") or "")
+                    if scheme == "commercialid":
+                        package_id = value
+                    elif scheme == "encproductid":
+                        enc_product_id = value
+
+            price_value = None
+            price_items = offering.get("price", [])
+            if isinstance(price_items, dict):
+                price_items = [price_items]
+            if isinstance(price_items, list):
+                for price_item in price_items:
+                    if not isinstance(price_item, dict):
+                        continue
+                    original = price_item.get("originalPrice") or {}
+                    if isinstance(original, dict) and original.get("value") is not None:
+                        price_value = original.get("value")
+                        break
+            try:
+                price = float(price_value)
+            except (TypeError, ValueError):
+                continue
+
+            quota, duration = "غير محدد", "غير محددة"
+            spec = offering.get("specification") or {}
+            characteristics = spec.get("characteristicsValue", []) if isinstance(spec, dict) else []
+            if isinstance(characteristics, list):
+                for char in characteristics:
+                    if not isinstance(char, dict):
+                        continue
+                    char_name = str(char.get("characteristicName", "")).upper()
+                    if char_name == "QUOTA":
+                        quota = f"{char.get('value', '')} {char.get('type', 'MB')}".strip()
+                    elif char_name == "DURATION":
+                        duration = str(char.get("value", duration))
+
+            # لا نعرض زر تفعيل لباقة لا تحتوي على المعرفين المطلوبين في طلب الشراء.
+            if price > 0 and package_id and enc_product_id:
+                packages.append({
+                    "index": len(packages) + 1,
+                    "name": name,
+                    "id": package_id,
+                    "encProductId": enc_product_id,
+                    "price": price,
+                    "quota": quota,
+                    "duration": duration,
+                })
+    return packages
+
+
+def _internet_fetch_packages_sync(token: str, phone: str, package_type: str) -> List[Dict[str, Any]]:
+    headers = _internet_api_headers(token, phone)
+    headers.update({"api-host": "EligibleProductOfferingHost", "useCase": "MIProducts"})
+    response = HTTP_SESSION.get(
+        INTERNET_OFFERING_URL,
+        params={"customerAccountId": phone, "type": "MIProducts"},
+        headers=headers,
+        timeout=25,
+    )
+    if response.status_code == 401:
+        raise PermissionError("انتهت صلاحية جلسة فودافون. أعد تسجيل الدخول.")
+    if response.status_code == 403:
+        raise PermissionError("هذه الباقات غير متاحة لهذا الخط حاليًا.")
+    if response.status_code != 200:
+        raise RuntimeError(f"فشل جلب الباقات من فودافون (HTTP {response.status_code}).")
+    return _internet_parse_offerings(response.json(), package_type)
+
+
+def _internet_activate_sync(token: str, phone: str, package: Dict[str, Any]) -> Tuple[bool, str]:
+    headers = _internet_api_headers(token, phone)
+    headers.update({"api-host": "ProductOrderingManagement", "useCase": "MIProfile"})
+    payload = {
+        "channel": {"name": "MobileApp"},
+        "orderItem": [{
+            "action": "add",
+            "product": {
+                "characteristic": [
+                    {"name": "LangId", "value": "ar"},
+                    {"name": "ExecutionType", "value": "Sync"},
+                    {"name": "DropAddons", "value": "False"},
+                    {"name": "OneStepMigrationFlag", "value": "Y"},
+                    {"name": "Journey", "value": "MI_ELigibility"},
+                ],
+                "encProductId": package["encProductId"],
+                "id": package["id"],
+                "relatedParty": [{"id": phone, "name": "MSISDN", "role": "Subscriber"}],
+                "@type": "MI",
+            },
+            "eCode": 0,
+        }],
+        "@type": "MIProfile",
+    }
+    response = HTTP_SESSION.post(
+        INTERNET_ORDER_URL,
+        headers=headers,
+        json=payload,
+        timeout=30,
+    )
+    if response.status_code in (200, 201, 202):
+        # 202 قد يعني قبول الطلب للمعالجة وليس اكتمال التفعيل النهائي.
+        if response.status_code == 202:
+            return True, "تم قبول طلب التفعيل وإرساله للمعالجة. راجع تطبيق أنا فودافون للتأكيد النهائي."
+        try:
+            body = response.json()
+            state = str(body.get("state", "")).lower()
+            status = str(body.get("status", "")).lower()
+            if any(word in state + " " + status for word in ("fail", "reject", "error")):
+                return False, "فودافون رفضت طلب التفعيل. راجع تفاصيل الخط وحاول لاحقًا."
+        except (ValueError, AttributeError):
+            pass
+        return True, "تم إرسال طلب التفعيل بنجاح. يُرجى مراجعة تطبيق أنا فودافون للتأكد من ظهور الباقة."
+    if response.status_code == 401:
+        return False, "انتهت صلاحية جلسة فودافون. أعد تسجيل الدخول ثم حاول مرة أخرى."
+    if response.status_code == 403:
+        return False, "الباقة غير مؤهلة للتفعيل على هذا الخط حاليًا."
+    return False, f"فشل طلب التفعيل (HTTP {response.status_code}). لم يتم تأكيد تنفيذ العملية."
+
+
+async def _internet_get_packages(phone: str, password: str, package_type: str) -> List[Dict[str, Any]]:
+    token, _ = await login_vodafone(phone, password)
+    return await asyncio.to_thread(_internet_fetch_packages_sync, token, phone, package_type)
+
+
+async def _internet_activate_package(phone: str, password: str, package: Dict[str, Any]) -> Tuple[bool, str]:
+    token, _ = await login_vodafone(phone, password)
+    return await asyncio.to_thread(_internet_activate_sync, token, phone, package)
+
+
+def _internet_usage_report_sync(token: str, phone: str) -> str:
+    """قراءة أرصدة الاستهلاك المتبقية من تقرير الاستخدام دون افتراض نوع الباقة."""
+    url = "https://mobile.vodafone.com.eg/services/dxl/usage/usageConsumptionReport"
+    params = {"@type": "aggregated", "bucket.product.publicIdentifier": phone}
+    headers = {
+        "User-Agent": "okhttp/4.12.0",
+        "Connection": "Keep-Alive",
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip",
+        "api-host": "usageConsumptionHost",
+        "useCase": "aggregated",
+        "Authorization": f"Bearer {token}",
+        "api-version": "v2",
+        "device-id": "b26ba335813fad21",
+        "x-agent-operatingsystem": "15",
+        "clientId": "AnaVodafoneAndroid",
+        "x-agent-device": "Samsung SM-A165F",
+        "x-agent-version": "2025.12.2",
+        "x-agent-build": "1080",
+        "msisdn": phone,
+        "Content-Type": "application/json",
+        "Accept-Language": "ar",
+    }
+    response = HTTP_SESSION.get(url, params=params, headers=headers, timeout=30)
+    if response.status_code == 401:
+        raise PermissionError("انتهت صلاحية جلسة فودافون. أعد تسجيل الدخول.")
+    if response.status_code != 200:
+        raise RuntimeError(f"تعذر قراءة تقرير الاستهلاك (HTTP {response.status_code}).")
+
+    data = response.json()
+    if isinstance(data, dict):
+        data = data.get("data", data.get("items", [data]))
+    if not isinstance(data, list):
+        return "لم ترجع فودافون بيانات استهلاك قابلة للعرض."
+
+    rows = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        item_label = str(item.get("name") or item.get("@type") or "استهلاك")
+        buckets = item.get("bucket", [])
+        if isinstance(buckets, dict):
+            buckets = [buckets]
+        if not isinstance(buckets, list):
+            continue
+        for bucket in buckets:
+            if not isinstance(bucket, dict):
+                continue
+            bucket_label = str(bucket.get("name") or bucket.get("usageType") or item_label)
+            balances = bucket.get("bucketBalance", [])
+            if isinstance(balances, dict):
+                balances = [balances]
+            if not isinstance(balances, list):
+                continue
+            for balance in balances:
+                if not isinstance(balance, dict) or balance.get("@type") != "Remaining":
+                    continue
+                value = balance.get("remainingValue") or {}
+                if not isinstance(value, dict) or value.get("amount") is None:
+                    continue
+                amount = value.get("amount")
+                unit = str(value.get("units") or value.get("unit") or "")
+                unit_key = unit.strip().lower()
+                usage_key = str(bucket.get("usageType") or "").lower()
+                data_units = {"kb", "mb", "gb", "byte", "bytes", "kbyte", "mbyte", "gbyte", "kilobyte", "megabyte", "gigabyte", "kilobytes", "megabytes", "gigabytes"}
+                if unit_key not in data_units and not any(term in usage_key for term in ("data", "internet", "volume")):
+                    continue
+                valid_for = balance.get("validFor") or {}
+                expiry = valid_for.get("endDateTime") if isinstance(valid_for, dict) else None
+                line = f"• {bucket_label}: {amount} {unit}".strip()
+                if expiry:
+                    line += f" | ينتهي: {str(expiry)[:10]}"
+                rows.append(line)
+
+    if not rows:
+        return "لم تتضمن استجابة فودافون أرصدة متبقية يمكن عرضها لهذا الخط."
+    return "\n".join(rows[:18])
+
+
+async def _internet_get_usage_report(phone: str, password: str) -> str:
+    token, _ = await login_vodafone(phone, password)
+    return await asyncio.to_thread(_internet_usage_report_sync, token, phone)
+
+
 # ================== واجهة باقات الإنترنت ==================
+INTERNET_SUBSCRIPTIONS_URL = "https://mobile.vodafone.com.eg/services/dxl/pim/product"
+
+
+def _internet_get_subscriptions_sync(token: str, phone: str) -> List[Dict[str, Any]]:
+    """قراءة المنتجات والاشتراكات الحالية من واجهة ProductInventoryManagement."""
+    headers = _internet_api_headers(token, phone)
+    headers.update({
+        "api-host": "ProductInventoryManagementHost",
+        "useCase": "AllInOne",
+        "x-agent-build": "1121",
+        "x-agent-version": "2026.2.4",
+        "x-agent-operatingsystem": "16",
+    })
+    params = {
+        "relatedParty.id": phone,
+        "@type": "AllInOne",
+        "relatedParty.name": "SubscriptionManagement",
+    }
+    response = HTTP_SESSION.get(INTERNET_SUBSCRIPTIONS_URL, params=params, headers=headers, timeout=25)
+    if response.status_code == 401:
+        raise PermissionError("انتهت جلسة فودافون. سجّل الدخول مرة أخرى.")
+    if response.status_code != 200:
+        raise RuntimeError(f"فشل جلب الاشتراكات (HTTP {response.status_code}).")
+    data = response.json()
+    if isinstance(data, dict):
+        data = data.get("data", data.get("items", [data]))
+    if not isinstance(data, list):
+        return []
+    return [item for item in data if isinstance(item, dict)]
+
+
+def _internet_subscription_details(item: Dict[str, Any]) -> Dict[str, Any]:
+    """توحيد بيانات الاشتراك مع عدم اعتبار العنصر قابلاً للإلغاء دون OPT-OUT صريح."""
+    if not isinstance(item, dict):
+        return {}
+
+    parts = item.get("parts") if isinstance(item.get("parts"), dict) else {}
+    offering = item.get("productOffering") or parts.get("productOffering") or {}
+    if isinstance(offering, list):
+        offering = offering[0] if offering else {}
+    if not isinstance(offering, dict):
+        offering = {}
+
+    # بعض استجابات Vodafone تعيد المعرفات داخل id[] باستخدام schemeName.
+    id_sources = [item.get("id"), offering.get("id")]
+    commercial_id = ""
+    enc_id = str(offering.get("encProductId") or item.get("encProductId") or "")
+    for source in id_sources:
+        if isinstance(source, list):
+            for entry in source:
+                if not isinstance(entry, dict):
+                    continue
+                scheme = str(entry.get("schemeName") or "").lower()
+                value = str(entry.get("value") or "")
+                if scheme == "commercialid":
+                    commercial_id = value
+                elif scheme == "encproductid":
+                    enc_id = value
+        elif isinstance(source, dict):
+            scheme = str(source.get("schemeName") or "").lower()
+            if scheme == "commercialid":
+                commercial_id = str(source.get("value") or "")
+            elif scheme == "encproductid":
+                enc_id = str(source.get("value") or "")
+
+    raw_item_id = item.get("id")
+    item_id = str(raw_item_id) if isinstance(raw_item_id, (str, int)) else (commercial_id or "")
+    if not item_id and isinstance(offering.get("id"), (str, int)):
+        item_id = str(offering.get("id"))
+    product_type = str(item.get("@type") or offering.get("type") or "")
+    status = str(item.get("status") or offering.get("status") or "")
+    name = str(offering.get("name") or item.get("name") or "").strip()
+
+    # OPT-OUT может находиться в характеристики элемента или в specification.
+    opt_out = ""
+    characteristic_sources = [
+        item.get("characteristic"),
+        offering.get("characteristic"),
+        (offering.get("specification") or {}).get("characteristicsValue")
+            if isinstance(offering.get("specification"), dict) else None,
+    ]
+    for source in characteristic_sources:
+        if isinstance(source, dict):
+            source = source.get("characteristicsValue", [source])
+        if not isinstance(source, list):
+            continue
+        for ch in source:
+            if isinstance(ch, dict):
+                key = str(ch.get("name") or ch.get("characteristicName") or "").upper()
+                if key == "OPT-OUT":
+                    opt_out = str(ch.get("value") or "").strip().upper()
+                    break
+        if opt_out:
+            break
+
+    description = ""
+    original_price = 0.0
+    due_price = 0.0
+    price_items = item.get("productPrice", []) or item.get("price", []) or []
+    if isinstance(price_items, dict):
+        price_items = [price_items]
+    for price_item in price_items if isinstance(price_items, list) else []:
+        if not isinstance(price_item, dict):
+            continue
+        description = description or str(price_item.get("description") or "")
+        amount_obj = price_item.get("price") or price_item.get("originalPrice") or {}
+        if not isinstance(amount_obj, dict):
+            amount_obj = {}
+        amount = amount_obj.get("taxIncludedAmount", {}).get("value", amount_obj.get("value", 0)) if isinstance(amount_obj.get("taxIncludedAmount", {}), dict) else amount_obj.get("value", 0)
+        try:
+            amount = float(amount or 0)
+        except (TypeError, ValueError):
+            amount = 0.0
+        if price_item.get("id") == "OPT-IN":
+            for ch in price_item.get("priceCharacteristic", []) or []:
+                if isinstance(ch, dict) and ch.get("name") == "amountToPay":
+                    try:
+                        due_price = float(ch.get("value", 0) or 0)
+                    except (TypeError, ValueError):
+                        pass
+        elif amount > 0 and original_price == 0:
+            original_price = amount / 100.0 if amount > 100 else amount
+
+    if not name:
+        name = description or item_id or "باقة إنترنت"
+    is_internet = (
+        product_type.upper() == "MI" or "MI_" in item_id.upper()
+        or "PLUS" in item_id.upper() or "EXTREME" in item_id.upper()
+        or "إنترنت" in name or "انترنت" in name or "نت" in name
+    )
+    status_active = status.strip().lower() in {"active", "1", "activated"}
+    # لا نعتمد على السعر أو مجرد وجود المنتج؛ الإلغاء مسموح فقط مع OPT-OUT=Y صريح.
+    cancelable = bool(is_internet and status_active and item_id and enc_id and opt_out == "Y")
+
+    expiry = ""
+    chars = item.get("characteristic", []) or []
+    if isinstance(chars, dict):
+        chars = chars.get("characteristicsValue", [chars])
+    for ch in chars if isinstance(chars, list) else []:
+        if isinstance(ch, dict) and (ch.get("name") or ch.get("characteristicName")) in ("PromoExpiryDate", "RenewalDate", "OfferDateFormat"):
+            val = str(ch.get("value") or "")
+            if val:
+                expiry = val.split("T")[0]
+                break
+
+    return {
+        "id": item_id,
+        "enc_product_id": enc_id,
+        "name": name,
+        "status": status or "غير محدد",
+        "price": due_price or original_price,
+        "expiry": expiry,
+        "is_internet": is_internet,
+        "opt_out": opt_out,
+        "cancelable": cancelable,
+    }
+
+
+def _internet_cancel_subscription_sync(token: str, phone: str, item_id: str, enc_product_id: str) -> Tuple[bool, str]:
+    """إرسال طلب إلغاء MI مطابق لبنية ProductOrderingManagement الملتقطة."""
+    if not item_id or not enc_product_id:
+        return False, "بيانات الباقة غير مكتملة؛ لم يتم إرسال أي طلب."
+
+    headers = _internet_api_headers(token, phone)
+    headers.update({
+        "api-host": "ProductOrderingManagement",
+        "useCase": "MIProfile",
+        "x-agent-build": "1121",
+        "x-agent-version": "2026.2.4",
+        "x-agent-operatingsystem": "16",
+        "Content-Type": "application/json; charset=UTF-8",
+    })
+    payload = {
+        "channel": {"name": "MobileApp"},
+        "orderItem": [{
+            "action": "delete",
+            "product": {
+                "characteristic": [
+                    {"name": "LangId", "value": "ar"},
+                    {"name": "ExecutionType", "value": "Sync"},
+                    {"name": "OneStepMigrationFlag", "value": "N"},
+                    {"name": "Journey", "value": "MI_AfterBundleOptions"},
+                ],
+                "encProductId": enc_product_id,
+                "id": item_id,
+                "relatedParty": [{"id": phone, "name": "MSISDN", "role": "Subscriber"}],
+                "@type": "MI",
+            },
+            "eCode": 0,
+        }],
+        "@type": "MIProfile",
+    }
+    response = HTTP_SESSION.post(INTERNET_ORDER_URL, headers=headers, json=payload, timeout=30)
+    if response.status_code in (200, 201):
+        try:
+            body = response.json()
+        except ValueError:
+            body = {}
+        state = str(body.get("state") or "").strip().lower() if isinstance(body, dict) else ""
+        if state == "completed":
+            return True, "اكتمل طلب الإلغاء حسب رد فودافون. حدّث الاشتراكات للتأكد من اختفاء الباقة."
+        return False, "استقبلت فودافون الطلب لكن لم ترجع تأكيد Completed؛ لم أعتبر الإلغاء مكتملاً."
+    if response.status_code == 202:
+        return False, "الطلب قيد المعالجة ولم يصل تأكيد نهائي. راجع التطبيق قبل إعادة المحاولة."
+    if response.status_code == 401:
+        return False, "انتهت جلسة فودافون. سجّل الدخول مرة أخرى."
+    return False, f"فودافون لم تؤكد الإلغاء (HTTP {response.status_code}). لم يتم اعتبار العملية ناجحة."
+
+
+async def _internet_get_subscriptions(phone: str, password: str) -> List[Dict[str, Any]]:
+    token, _ = await login_vodafone(phone, password)
+    raw = await asyncio.to_thread(_internet_get_subscriptions_sync, token, phone)
+    parsed = [_internet_subscription_details(item) for item in raw]
+    return [item for item in parsed if item["is_internet"]]
+
+
+async def _internet_cancel_subscription(phone: str, password: str, item: Dict[str, Any]) -> Tuple[bool, str]:
+    token, _ = await login_vodafone(phone, password)
+    return await asyncio.to_thread(
+        _internet_cancel_subscription_sync, token, phone,
+        str(item.get("id") or ""), str(item.get("enc_product_id") or "")
+    )
+
+
+async def _show_current_internet_subscriptions(update: Update, user_id: int, context: ContextTypes.DEFAULT_TYPE, cancellation_mode: bool = False) -> None:
+    user = await ensure_valid_session(update, user_id)
+    if not user:
+        await show_login_screen(update, user_id, context)
+        return
+    phone = user["phone"]
+    password = get_saved_password(user_id, phone)
+    if not password:
+        await query_or_message(update, "🔐 كلمة المرور المحفوظة غير متاحة. سجّل الدخول مرة أخرى.")
+        return
+    action_title = "العناصر المؤهلة للإلغاء" if cancellation_mode else "باقات الإنترنت الموجودة على الخط"
+    await query_or_message(update, f"⏳ جاري جلب {action_title} للرقم {phone}...")
+    try:
+        items = await _internet_get_subscriptions(phone, password)
+    except Exception as exc:
+        logger.warning("Internet subscriptions lookup failed for user %s: %s", user_id, exc)
+        await query_or_message(update, f"❌ تعذر جلب اشتراكات الإنترنت.\n{exc}")
+        return
+    if not items:
+        await query_or_message(update, "ℹ️ لم تُرجع فودافون أي باقات إنترنت مسجلة لهذا الرقم.")
+        return
+    context.user_data["internet_subscriptions_cache"] = {"phone": phone, "items": items}
+    if cancellation_mode:
+        choices = [(i, item) for i, item in enumerate(items) if item.get("cancelable")]
+        if not choices:
+            body = (
+                "📋 تم العثور على باقات الإنترنت، لكن لا توجد بينها عناصر مصنفة كقابلة للإلغاء "
+                "وفق قواعد ملف الخدمات المرجعي.\n\n"
+                "الباقات الأساسية النشطة مستثناة من طلب الحذف؛ لن أرسل طلب إلغاء غير مضمون لها."
+            )
+            keyboard = [[InlineKeyboardButton("👁️ معرفة الباقات الموجودة", callback_data="internet_subscriptions_info")],
+                        [InlineKeyboardButton("🔙 رجوع لباقات النت", callback_data="internet_packages_menu")]]
+            markup = InlineKeyboardMarkup(keyboard)
+            if update.callback_query:
+                await update.callback_query.edit_message_text(body, reply_markup=markup, parse_mode=None)
+            else:
+                await send_message(update, user_id, body, markup, parse_mode=None)
+            return
+        keyboard = []
+        cancel_buttons = [
+            InlineKeyboardButton(f"🗑️ {item['name'][:24]}", callback_data=f"internet_sub_cancel_{idx}")
+            for idx, item in choices
+        ]
+        for pos in range(0, len(cancel_buttons), 2):
+            keyboard.append(cancel_buttons[pos:pos + 2])
+        keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data="internet_packages_menu")])
+        body = "🗑️ العناصر التي تسمح بياناتها بطلب الإلغاء:\n\n" + "\n".join(
+            f"• {item['name']} — الحالة: {item['status']} — OPT-OUT: {item.get('opt_out') or 'غير متاح'}" for _, item in choices
+        ) + "\n\nاختر العنصر، ثم راجع التأكيد قبل إرسال الطلب."
+    else:
+        lines = []
+        for i, item in enumerate(items, 1):
+            price = f" — {item['price']:g} جنيه" if item.get("price") else ""
+            expiry = f" — التجديد: {item['expiry']}" if item.get("expiry") else ""
+            lines.append(f"{i}. 🌐 {item['name']}\n   الحالة: {item['status']}{price}{expiry}")
+        body = "📋 باقات الإنترنت المسجلة على الخط:\n\n" + "\n\n".join(lines)
+        keyboard = [[InlineKeyboardButton("🗑️ إلغاء عنصر مؤهل", callback_data="internet_cancel_info")],
+                    [InlineKeyboardButton("🔄 تحديث القائمة", callback_data="internet_subscriptions_info")],
+                    [InlineKeyboardButton("🔙 رجوع لباقات النت", callback_data="internet_packages_menu")]]
+    markup = InlineKeyboardMarkup(keyboard)
+    if update.callback_query:
+        await update.callback_query.edit_message_text(body, reply_markup=markup, parse_mode=None)
+    else:
+        await send_message(update, user_id, body, markup, parse_mode=None)
+
+
+async def _handle_internet_subscription_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE, confirm: bool = False) -> None:
+    query = update.callback_query
+    user_id = query.from_user.id
+    parts = query.data.split("_")
+    index_text = parts[-1] if parts else ""
+    if not index_text.isdigit():
+        await query.edit_message_text("❌ اختيار الإلغاء غير صالح.")
+        return
+    cache = context.user_data.get("internet_subscriptions_cache", {})
+    user = await ensure_valid_session(update, user_id)
+    if not user or cache.get("phone") != (user or {}).get("phone"):
+        context.user_data.pop("internet_subscriptions_cache", None)
+        await query.edit_message_text("⌛ انتهت صلاحية قائمة الاشتراكات. افتحها من جديد.")
+        return
+    items = cache.get("items", [])
+    idx = int(index_text)
+    if idx >= len(items) or not items[idx].get("cancelable"):
+        await query.edit_message_text("❌ هذا العنصر غير متاح للإلغاء من خلال الواجهة الحالية.")
+        return
+    item = items[idx]
+    if not confirm:
+        context.user_data["internet_pending_cancel"] = {"phone": user["phone"], "index": idx}
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⚠️ تأكيد طلب الإلغاء", callback_data=f"internet_sub_cancel_confirm_{idx}")],
+            [InlineKeyboardButton("↩️ رجوع للقائمة", callback_data="internet_cancel_info")],
+        ])
+        await query.edit_message_text(
+            f"⚠️ تأكيد طلب إلغاء عنصر الإنترنت\n\n📦 {item['name']}\n📱 {user['phone']}\n\n"
+            "لن يُرسل الطلب إلا بعد ضغط التأكيد. قبول فودافون للطلب لا يعني بالضرورة اكتمال الإلغاء فورًا.",
+            reply_markup=keyboard, parse_mode=None
+        )
+        return
+    pending = context.user_data.get("internet_pending_cancel", {})
+    if pending.get("phone") != user["phone"] or pending.get("index") != idx:
+        context.user_data.pop("internet_pending_cancel", None)
+        await query.edit_message_text("⌛ انتهت صلاحية التأكيد. افتح قائمة الإلغاء من جديد.")
+        return
+    password = get_saved_password(user_id, user["phone"])
+    context.user_data.pop("internet_pending_cancel", None)
+    if not password:
+        await query.edit_message_text("🔐 كلمة المرور غير متاحة. سجّل الدخول مرة أخرى.")
+        return
+    # تحقق أخير من فودافون قبل الحذف حتى لا نستخدم قائمة قديمة أو معرفًا لم يعد مؤهلاً.
+    await query.edit_message_text("🔎 جارٍ التحقق من حالة الباقة قبل الإلغاء...")
+    try:
+        latest_items = await _internet_get_subscriptions(user["phone"], password)
+        latest = next((entry for entry in latest_items
+                       if entry.get("id") == item.get("id")
+                       and entry.get("enc_product_id") == item.get("enc_product_id")
+                       and entry.get("cancelable")), None)
+        if not latest:
+            context.user_data.pop("internet_subscriptions_cache", None)
+            result = "⚠️ تغيرت حالة الباقة أو لم تعد تسمح بالإلغاء. لم يتم إرسال أي طلب. حدّث القائمة وحاول من جديد."
+        else:
+            operation_lock = get_user_operation_lock(user_id)
+            if operation_lock.locked():
+                result = "⏳ توجد عملية أخرى على الحساب. لم يتم إرسال طلب الإلغاء؛ حاول بعد انتهائها."
+            else:
+                await query.edit_message_text("⏳ تم التحقق، جارٍ إرسال طلب الإلغاء إلى فودافون...")
+                async with operation_lock:
+                    success, message = await _internet_cancel_subscription(user["phone"], password, latest)
+                log_action(user_id, "INTERNET_SUBSCRIPTION_CANCEL_REQUEST", f"{latest['name']}:{success}")
+                result = ("✅ " if success else "❌ ") + message + f"\n\n📦 {latest['name']}"
+    except Exception as exc:
+        logger.exception("Internet subscription cancellation failed for user %s", user_id)
+        result = f"❌ تعذر تنفيذ طلب الإلغاء: {exc}"
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 تحديث الاشتراكات", callback_data="internet_subscriptions_info")],
+        [InlineKeyboardButton("🔙 رجوع لباقات النت", callback_data="internet_packages_menu")],
+    ])
+    await query.edit_message_text(result, reply_markup=keyboard, parse_mode=None)
+
+
 async def show_internet_packages_menu(update: Update, user_id: int, context: Optional[ContextTypes.DEFAULT_TYPE]) -> None:
     is_callback = update.callback_query is not None
     if not await require_subscription_or_free(update, context, is_callback=is_callback, query=update.callback_query if is_callback else None):
@@ -821,14 +1455,15 @@ async def show_internet_packages_menu(update: Update, user_id: int, context: Opt
 
     keyboard = [
         [InlineKeyboardButton("⚡ باقات إكستريم", callback_data="internet_extreme_info"), InlineKeyboardButton("➕ باقات بلص", callback_data="internet_plus_info")],
-        [InlineKeyboardButton("📊 تقرير باقات الإنترنت", callback_data="internet_report_info")],
-        [InlineKeyboardButton("🗑️ إلغاء باقة إنترنت", callback_data="internet_cancel_info")],
+        [InlineKeyboardButton("👁️ معرفة الباقات الموجودة", callback_data="internet_subscriptions_info")],
+        [InlineKeyboardButton("📊 تقرير استهلاك الإنترنت", callback_data="internet_report_info")],
+        [InlineKeyboardButton("🗑️ إلغاء الباقات المؤهلة", callback_data="internet_cancel_info")],
         [InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="main_menu")],
     ]
     menu_text = (
         "🌐 **إدارة باقات الإنترنت**\n\n"
-        "اختر القسم المطلوب. العرض الحالي معلوماتي؛ التفعيل وقراءة البيانات والإلغاء "
-        "لن تُنفذ قبل توفير واجهة رسمية موثقة."
+        "اختر نوع الباقات لعرض العروض المؤهلة لرقمك من فودافون.\n"
+        "سيظهر لك السعر والسعة والمدة، ولن يتم إرسال طلب تفعيل إلا بعد تأكيدك."
     )
     markup = InlineKeyboardMarkup(keyboard)
     if update.callback_query:
@@ -837,34 +1472,218 @@ async def show_internet_packages_menu(update: Update, user_id: int, context: Opt
         await send_message(update, user_id, menu_text, markup, parse_mode="Markdown")
 
 
-async def show_internet_package_info(update: Update, user_id: int, section: str) -> None:
-    if section == "extreme":
-        body = (
-            "⚡ **باقات إكستريم**\n\n"
-            "• إكستريم 13 — 10 جنيه\n"
-            "• إكستريم 26 — 20 جنيه\n"
-            "• إكستريم 52 — 40 جنيه\n\n"
-            "هذه التفاصيل من الملف المرجعي المرفق، وليست تحققًا من الأسعار الحالية."
+async def _show_live_internet_packages(update: Update, user_id: int, context: ContextTypes.DEFAULT_TYPE, package_type: str) -> None:
+    user = await ensure_valid_session(update, user_id)
+    if not user:
+        await show_login_screen(update, user_id, context)
+        return
+    phone = user["phone"]
+    password = get_saved_password(user_id, phone)
+    if not password:
+        await query_or_message(
+            update,
+            "🔐 كلمة المرور المحفوظة غير متاحة لخدمة الباقات.\n"
+            "سجّل الدخول مرة أخرى من /start ثم أعد المحاولة.",
         )
-    elif section == "plus":
-        body = (
-            "➕ **باقات بلص**\n\n"
-            "• باقة بلص 20\n• باقة بلص 32\n• باقة بلص 45\n\n"
-            "الملف المرجعي لا يحدد أسعار هذه الباقات."
+        return
+
+    title = "باقات Plus" if package_type == "plus" else "باقات إكستريم"
+    await query_or_message(update, f"⏳ جاري جلب {title} المؤهلة للرقم `{phone}`...", parse_mode="Markdown")
+    try:
+        packages = await _internet_get_packages(phone, password, package_type)
+    except PermissionError as exc:
+        await query_or_message(update, f"🔒 {exc}")
+        return
+    except Exception as exc:
+        logger.warning("Internet package lookup failed for user %s (%s): %s", user_id, package_type, exc)
+        await query_or_message(update, f"❌ تعذر جلب {title}.\n{exc}")
+        return
+
+    if not packages:
+        await query_or_message(
+            update,
+            f"ℹ️ لم ترجع فودافون أي باقات {title} مؤهلة لهذا الرقم حاليًا.\n"
+            "قد تختلف العروض حسب نظام الخط وأهليته.",
+            parse_mode=None,
         )
-    elif section == "report":
-        body = "📊 التقرير المباشر غير مفعّل حاليًا. يلزم توثيق واجهة رسمية لقراءة استهلاك الباقات قبل ربطها."
+        return
+
+    context.user_data["internet_packages_cache"] = {
+        "type": package_type,
+        "phone": phone,
+        "packages": packages,
+    }
+    keyboard = []
+    # عرض الباقات في عمودين لتقليل طول القائمة وإظهار عدد أكبر على الشاشة.
+    package_buttons = []
+    for pkg in packages:
+        price = f"{pkg['price']:g}"
+        name = str(pkg.get('name') or 'باقة')
+        # اختصار الاسم داخل الزر فقط؛ التفاصيل الكاملة تظهر بعد الاختيار.
+        short_name = name.replace('باقة', '').strip()
+        label = f"{short_name[:22]} | {price}ج"
+        package_buttons.append(InlineKeyboardButton(
+            label[:60], callback_data=f"internet_pkg_select_{package_type}_{pkg['index']}"
+        ))
+    for i in range(0, len(package_buttons), 2):
+        keyboard.append(package_buttons[i:i + 2])
+    keyboard.append([InlineKeyboardButton("🔄 تحديث الباقات", callback_data=f"internet_{package_type}_info")])
+    keyboard.append([InlineKeyboardButton("🔙 رجوع لباقات النت", callback_data="internet_packages_menu")])
+    await query_or_message(
+        update,
+        f"{'➕' if package_type == 'plus' else '⚡'} **{title} المتاحة حاليًا**\n"
+        f"📱 الرقم: `{phone}`\n"
+        f"📦 عدد الباقات المؤهلة: {len(packages)}\n\n"
+        "اختر الباقة لعرض تفاصيلها ومراجعة التفعيل قبل التنفيذ:",
+        parse_mode="Markdown",
+    )
+    if update.callback_query:
+        try:
+            await update.callback_query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+        except Exception:
+            await update.callback_query.message.reply_text("اختر الباقة:", reply_markup=InlineKeyboardMarkup(keyboard))
     else:
-        body = "🗑️ إلغاء باقات الإنترنت غير مفعّل حاليًا. لن يتم إرسال طلب إلغاء قبل اعتماد واجهة رسمية موثقة واختبارها."
+        await send_message(update, user_id, "اختر الباقة:", InlineKeyboardMarkup(keyboard))
+
+
+async def _handle_internet_package_selection(update: Update, context: ContextTypes.DEFAULT_TYPE, confirm: bool = False) -> None:
+    query = update.callback_query
+    user_id = query.from_user.id
+    parts = query.data.split("_")
+    # internet_pkg_select_<type>_<index> / internet_pkg_confirm_<type>_<index>
+    if len(parts) != 5 or parts[3] not in ("plus", "extreme"):
+        await query.edit_message_text("❌ بيانات اختيار الباقة غير صالحة.")
+        return
+    package_type, index_text = parts[3], parts[4]
+    if not index_text.isdigit():
+        await query.edit_message_text("❌ رقم الباقة غير صالح.")
+        return
+
+    cache = context.user_data.get("internet_packages_cache", {})
+    if cache.get("type") != package_type:
+        await query.edit_message_text("⌛ انتهت صلاحية قائمة الباقات. ارجع وحدّث القائمة من جديد.")
+        return
+    user = await ensure_valid_session(update, user_id)
+    if not user:
+        await show_login_screen(update, user_id, context)
+        return
+    if cache.get("phone") != user.get("phone"):
+        context.user_data.pop("internet_packages_cache", None)
+        await query.edit_message_text("⚠️ تم تغيير الرقم الحالي. حدّث قائمة الباقات للحساب الجديد.")
+        return
+
+    selected = next((p for p in cache.get("packages", []) if int(p.get("index", -1)) == int(index_text)), None)
+    if not selected:
+        await query.edit_message_text("❌ الباقة لم تعد موجودة في القائمة. حدّث الباقات وحاول مجددًا.")
+        return
+
+    if not confirm:
+        context.user_data["internet_pending_package"] = {
+            "type": package_type,
+            "phone": user["phone"],
+            "package": selected,
+        }
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ تأكيد طلب التفعيل", callback_data=f"internet_pkg_confirm_{package_type}_{index_text}")],
+            [InlineKeyboardButton("↩️ اختيار باقة أخرى", callback_data=f"internet_{package_type}_info")],
+            [InlineKeyboardButton("🔙 رجوع لباقات النت", callback_data="internet_packages_menu")],
+        ])
+        details = (
+            f"📦 مراجعة الباقة قبل التفعيل\n\n"
+            f"النوع: {'Plus' if package_type == 'plus' else 'Extreme'}\n"
+            f"الاسم: {selected['name']}\n"
+            f"💰 السعر: {selected['price']:g} جنيه\n"
+            f"💾 السعة: {selected['quota']}\n"
+            f"⏱️ المدة: {selected['duration']}\n"
+            f"📱 الرقم: {user['phone']}\n\n"
+            "⚠️ لن يُرسل طلب التفعيل إلا بعد ضغط زر التأكيد."
+        )
+        await query.edit_message_text(details, reply_markup=keyboard, parse_mode=None)
+        return
+
+    pending = context.user_data.get("internet_pending_package", {})
+    pending_package = pending.get("package") or {}
+    if (pending.get("type") != package_type or pending.get("phone") != user.get("phone")
+            or pending_package.get("index") != selected.get("index")):
+        context.user_data.pop("internet_pending_package", None)
+        await query.edit_message_text("⌛ انتهت صلاحية تأكيد الباقة. اخترها مرة أخرى من القائمة.")
+        return
+
+    password = get_saved_password(user_id, user["phone"])
+    if not password:
+        await query.edit_message_text("🔐 كلمة المرور المحفوظة غير متاحة. سجّل الدخول مرة أخرى ثم أعد المحاولة.")
+        context.user_data.pop("internet_pending_package", None)
+        return
+
+    # احذف حالة التأكيد قبل بدء الطلب لمنع النقر المكرر.
+    context.user_data.pop("internet_pending_package", None)
+    await query.edit_message_text("⏳ جارٍ إرسال طلب التفعيل إلى فودافون...", parse_mode=None)
+    try:
+        success, message = await _internet_activate_package(user["phone"], password, selected)
+        if success:
+            log_action(user_id, "INTERNET_PACKAGE_REQUEST_ACCEPTED", f"{package_type}:{selected['name']}:{selected['price']}")
+            result_text = (
+                f"✅ تم إرسال طلب الباقة\n\n"
+                f"📦 {selected['name']}\n"
+                f"💰 {selected['price']:g} جنيه\n"
+                f"📱 الرقم: {user['phone']}\n\n{message}"
+            )
+        else:
+            log_action(user_id, "INTERNET_PACKAGE_REQUEST_FAILED", f"{package_type}:{selected['name']}")
+            result_text = f"❌ لم يتم تأكيد التفعيل\n\n{selected['name']}\n{message}"
+    except Exception as exc:
+        logger.exception("Internet package activation error for user %s", user_id)
+        result_text = f"❌ حدث خطأ أثناء طلب التفعيل: {exc}"
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 عرض باقات الإنترنت", callback_data="internet_packages_menu")],
+        [InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="main_menu")],
+    ])
+    await query.edit_message_text(result_text, reply_markup=keyboard, parse_mode=None)
+
+
+async def show_internet_package_info(update: Update, user_id: int, section: str, context: Optional[ContextTypes.DEFAULT_TYPE] = None) -> None:
+    if section in ("plus", "extreme"):
+        if context is None:
+            await query_or_message(update, "❌ تعذر بدء خدمة الباقات. حاول من القائمة الرئيسية.")
+            return
+        await _show_live_internet_packages(update, user_id, context, section)
+        return
+
+    if section == "report":
+        user = await ensure_valid_session(update, user_id)
+        if not user:
+            await show_login_screen(update, user_id, context)
+            return
+        password = get_saved_password(user_id, user["phone"])
+        if not password:
+            await query_or_message(update, "🔐 كلمة المرور المحفوظة غير متاحة. سجّل الدخول مرة أخرى ثم أعد المحاولة.")
+            return
+        await query_or_message(update, "⏳ جاري قراءة تقرير استهلاك باقات الإنترنت من فودافون...")
+        try:
+            report = await _internet_get_usage_report(user["phone"], password)
+            body = (
+                "📊 تقرير أرصدة الاستخدام المتبقية\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                f"📱 الرقم: {user['phone']}\n\n"
+                f"{report}\n\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "ملاحظة: يعرض التقرير الأرصدة التي أرجعتها واجهة فودافون وقت الطلب."
+            )
+        except Exception as exc:
+            logger.warning("Internet usage report failed for user %s: %s", user_id, exc)
+            body = f"❌ تعذر جلب تقرير الإنترنت: {exc}"
+    else:
+        await _show_current_internet_subscriptions(update, user_id, context, cancellation_mode=True)
+        return
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔙 رجوع لباقات النت", callback_data="internet_packages_menu")],
         [InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="main_menu")],
     ])
     if update.callback_query:
-        await update.callback_query.edit_message_text(body, reply_markup=keyboard, parse_mode="Markdown")
+        await update.callback_query.edit_message_text(body, reply_markup=keyboard, parse_mode=None)
     else:
-        await send_message(update, user_id, body, keyboard, parse_mode="Markdown")
+        await send_message(update, user_id, body, keyboard, parse_mode=None)
 
 
 # ================== القائمة الرئيسية وإدارة العائلة (بعد التعديلات) ==================
@@ -878,7 +1697,7 @@ async def show_main_menu(update: Update, user_id: int, context: Optional[Context
     if context and context.user_data.get('rocket_members') is None:
         context.user_data['rocket_members'] = []
 
-    acc_name = user.get('account_name') or "بطل"
+    acc_name = user.get('account_name') or "VF-app"
     keyboard = [
         [InlineKeyboardButton("🚀 تعليق دعوتين (VIP)", callback_data="sendonly_menu")],
         [InlineKeyboardButton("📅 تزويد يومين", callback_data="add_two_days"), InlineKeyboardButton("🏠 إدارة العائلة", callback_data="show_family")],
@@ -888,13 +1707,13 @@ async def show_main_menu(update: Update, user_id: int, context: Optional[Context
         [InlineKeyboardButton("🔄 حساب آخر", callback_data="another_account"), InlineKeyboardButton("📞 أرقامي المحفوظة", callback_data="show_saved")]
     ]
     text = (
-        f"👑 **أهلاً بيك يا أستاذ {acc_name} في لوحة التحكم** 👑\n"
+        f"👑 **أهلاً بيك يـ  {acc_name} في لوحة التحكم** 👑\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"👤 **اسم الحساب:** `{acc_name}`\n"
         f"📱 **الرقم الحالي:** `{user['phone']}`\n"
-        "🛡️ **نظام الحماية:** بصمة جهاز ثابتة (Anti-Ban) ✅\n"
+        "🛡️ **نظام الحماية:** مــفــعـل ✅\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "اختر الخدمة المطلوبة من الأزرار أدناه:"
+        "اختر الخدمة المطلوبة من الأزرار أدناه 👇🏻:"
     )
     await send_message(update, user_id, text, InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
@@ -2152,8 +2971,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if get_user(user_id):
         await show_main_menu(update, user_id, context)
     else:
-        tg_name = update.effective_user.first_name if update.effective_user and update.effective_user.first_name else "بطل"
-        await send_message(update, user_id, f"🐋 حــوت الـمـجـال | HOOT ALMGAL\n\n⚡ أهلاً بيك يا أستاذ {tg_name} في لوحة التحكم الذكية\n🔐 سجّل دخولك للبدء:")
+        tg_name = f"@{update.effective_user.username}" if update.effective_user and update.effective_user.username else update.effective_user.first_name
+        await send_message(update, user_id, 
+    f"🔹حـوت الـمـجـال | HOT ALMGAL 🐋\n\n"
+    f"🔹 اهـلا بيك يــ ✨{tg_name}✨\n\n"
+    f"🔹 يـلا يا وحش المجال سجل دخول ⬇️"
+)
         await show_login_screen(update, user_id, context)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2258,11 +3081,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🔄 جاري تسجيل الدخول والتحقق من بيانات الحساب...", parse_mode=None)
         try:
             token, expiry = await login_vodafone(phone, password)
-            fallback_name = update.effective_user.first_name if update.effective_user and update.effective_user.first_name else "بطل"
+            fallback_name = update.effective_user.first_name if update.effective_user and update.effective_user.first_name else "VF-app"
             acc_name = await fetch_vodafone_customer_name(token, phone, fallback_name)
             save_user(user_id, phone, token, expiry, acc_name)
             save_password(user_id, phone, password, 72)
-            await update.message.reply_text(f"✅ أهلاً بيك يا أستاذ {acc_name}، تم تسجيل الدخول بنجاح 🎉", parse_mode=None)
+            await update.message.reply_text(f"✅ أهلاً بيك يـ  {acc_name}، تم تسجيل الدخول بنجاح 🎉", parse_mode=None)
             del user_states[user_id]
             await show_main_menu(update, user_id, context)
         except Exception as e:
@@ -2307,11 +3130,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         new_phone, password = state_data.get('new_phone'), text
         try:
             token, expiry = await login_vodafone(new_phone, password)
-            fallback_name = update.effective_user.first_name if update.effective_user and update.effective_user.first_name else "بطل"
+            fallback_name = update.effective_user.first_name if update.effective_user and update.effective_user.first_name else "VF-app"
             acc_name = await fetch_vodafone_customer_name(token, new_phone, fallback_name)
             save_user(user_id, new_phone, token, expiry, acc_name)
             save_password(user_id, new_phone, password, 72)
-            await update.message.reply_text(f"✅ أهلاً بيك يا أستاذ {acc_name}، تم التبديل إلى الرقم {new_phone} بنجاح 🎉", parse_mode=None)
+            await update.message.reply_text(f"✅ أهلاً بيك يـ {acc_name}، تم التبديل إلى الرقم {new_phone} بنجاح 🎉", parse_mode=None)
             del user_states[user_id]
             await show_main_menu(update, user_id, context)
         except Exception as e:
@@ -2384,6 +3207,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_internet_packages_menu(update, user_id, context)
         return
 
+    if data == "internet_subscriptions_info":
+        if not await require_subscription_or_free(update, context, is_callback=True, query=query):
+            return
+        await _show_current_internet_subscriptions(update, user_id, context, cancellation_mode=False)
+        return
+
     if data in {"internet_extreme_info", "internet_plus_info", "internet_report_info", "internet_cancel_info"}:
         if not await require_subscription_or_free(update, context, is_callback=True, query=query):
             return
@@ -2397,7 +3226,23 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "internet_report_info": "report",
             "internet_cancel_info": "cancel",
         }[data]
-        await show_internet_package_info(update, user_id, section)
+        await show_internet_package_info(update, user_id, section, context)
+        return
+
+    if data.startswith("internet_sub_cancel_confirm_"):
+        await _handle_internet_subscription_cancel(update, context, confirm=True)
+        return
+
+    if data.startswith("internet_sub_cancel_"):
+        await _handle_internet_subscription_cancel(update, context, confirm=False)
+        return
+
+    if data.startswith("internet_pkg_select_"):
+        await _handle_internet_package_selection(update, context, confirm=False)
+        return
+
+    if data.startswith("internet_pkg_confirm_"):
+        await _handle_internet_package_selection(update, context, confirm=True)
         return
 
     if data == "show_consumption":
@@ -2429,10 +3274,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if token and exp_dt:
             acc_name = get_saved_account_name(user_id, num)
             if not acc_name:
-                fallback_name = query.from_user.first_name if query.from_user and query.from_user.first_name else "بطل"
+                fallback_name = query.from_user.first_name if query.from_user and query.from_user.first_name else "VF-app"
                 acc_name = await fetch_vodafone_customer_name(token, num, fallback_name)
             save_user(user_id, num, token, exp_dt, acc_name)
-            await query.edit_message_text(f"✅ أهلاً بيك يا أستاذ {acc_name}، تم تسجيل الدخول للرقم {num} بنجاح 🎉", parse_mode=None)
+            await query.edit_message_text(f" أهلاً بيك يـ {acc_name}، تم  تسجيل دخول {num} بنجاح ✅", parse_mode=None)
             await show_main_menu(update, user_id, context)
         else:
             user_states[user_id] = {'state': 'switch_account_ask', 'new_phone': num}
